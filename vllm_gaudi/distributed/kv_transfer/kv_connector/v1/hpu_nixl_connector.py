@@ -20,6 +20,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector import (Transfe
                                                                          compute_nixl_compatibility_hash)
 from vllm_gaudi.platform import logger
 import habana_frameworks.torch.utils.experimental as htexp
+import os
 
 from vllm import envs
 from vllm.config import VllmConfig
@@ -653,6 +654,44 @@ def initialize_host_xfer_buffer(self, kv_caches: dict[str, torch.Tensor]) -> Non
 
     self.host_xfer_buffers = xfer_buffers
 
+def initialize_host_xfer_buffer_no_permute(self, kv_caches: dict[str, torch.Tensor]) -> None:
+    """
+    Initialize transfer buffer in CPU mem for accelerators
+    NOT directly supported by NIXL (e.g., tpu)
+
+    NOTE(Chendi): override to support HPU heterogeneousTP size.
+    We intend to prepare host_buffer with HND layout as stride layout
+    However, we want to keep shape as NHD
+
+    NOTE(Daniel): Override to support HPU heterogeneous TP size did a permute trick to prepare
+    # host_buffer with HND physical layout but NHD logical shape. The intent
+    # was to auto-convert HND->NHD during the copy operation.
+    #
+    # However, this causes double permutation when enable_permute_local_kv=True
+    #   1. Permute trick: HND data written to permuted view -> auto-converts to NHD
+    #   2. post_process_device_kv_on_receive: permutes again assuming HND input
+    # Result: Data is permuted twice, producing corrupted output.
+    #
+    # Since enable_permute_local_kv=True is REQUIRED for heterogeneous HND<->NHD
+    # transfers (it is *forced* by vLLM's nixl_connector.py), we cannot disable
+    # post_process_device_kv_on_receive. Therefore, we remove the permute
+    # trick and let post_process_device_kv_on_receive handle HND->NHD conversion.
+    #
+    # Flow: NIXL writes HND -> host buffer (HND) -> copy to device (HND)
+    #       -> post_process_device_kv_on_receive permutes HND->NHD (once)
+    """
+
+    xfer_buffers: dict[str, torch.Tensor] = {}
+    try:
+        for layer_name, kv_cache in kv_caches.items():
+            kv_shape = kv_cache.shape
+            kv_dtype = kv_cache.dtype
+            xfer_buffers[layer_name] = torch.empty(kv_shape, dtype=kv_dtype, device="cpu")
+    except MemoryError as e:
+        logger.error("NIXLConnectorWorker gets %s.", e)
+        raise
+
+    self.host_xfer_buffers = xfer_buffers
 
 def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
     """Register the KV Cache data in nixl."""
@@ -1064,9 +1103,13 @@ NixlConnectorScheduler.update_state_after_alloc = update_state_after_alloc
 NixlConnectorScheduler.build_connector_meta = build_connector_meta
 NixlConnectorScheduler.request_finished = request_finished
 NixlConnectorWorker.__init__ = NixlConnectorWorker_init_
-NixlConnectorWorker.initialize_host_xfer_buffer = initialize_host_xfer_buffer
 NixlConnectorWorker.register_kv_caches = register_kv_caches
 NixlConnectorWorker.register_local_xfer_handler = register_local_xfer_handler
 NixlConnectorWorker.kv_caches_postprocess = kv_caches_postprocess
 NixlConnectorWorker.post_process_device_kv_on_save = post_process_device_kv_on_save
 NixlConnectorWorker._read_blocks = _read_blocks
+
+enable_host_xfer_permute = os.environ.get("VLLM_GAUDI_HOST_XFER_PERMUTE", "0").lower() in ("1", "true", "yes", "y", "on")
+logger.info(f"{enable_host_xfer_permute=}")
+NixlConnectorWorker.initialize_host_xfer_buffer = initialize_host_xfer_buffer if enable_host_xfer_permute else initialize_host_xfer_buffer_no_permute
+
